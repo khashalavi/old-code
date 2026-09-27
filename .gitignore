@@ -1,0 +1,7 @@
+# marvin runtime files
+old_env/
+logs/
+journal.txt
+offload/
+save_data/.tmp_*/
+.env
