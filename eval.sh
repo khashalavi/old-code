@@ -21,6 +21,8 @@
 # Results (in this folder):
 #   save_data/<DATASET>/<MODEL>/<checkpoint-XXX>_output.json
 #   save_data/summary.tsv   (one line per eval: dataset, model, checkpoint, accuracy)
+# then committed + pushed to git (commit_results in marvin_common.sh;
+# COMMIT_RESULTS=0 to disable).
 # ============================================================================
 set -euo pipefail
 
@@ -116,3 +118,6 @@ ACC="$(sed -n 's/^Accuracy:[[:space:]]*//p' "$LOG_OUT" | tail -n1)"
 [ -f "$RESULTS_DIR/summary.tsv" ] || printf 'date\tdataset\tmodel\tcheckpoint\taccuracy\tjob\n' > "$RESULTS_DIR/summary.tsv"
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +'%F %T')" "$DATASET" "$MODEL" "$(basename "$CHECKPOINT")" "${ACC:-?}" "$JOB_ID" >> "$RESULTS_DIR/summary.tsv"
 echo "Results: $RESULT  (accuracy ${ACC:-?})"
+
+# commit + push save_data/ right away (heart_beat retries if this fails)
+commit_results

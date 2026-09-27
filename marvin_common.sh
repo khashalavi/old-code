@@ -7,7 +7,8 @@
 # WHERE THINGS LIVE
 #   old-code/old_env/            venv (built by setup_env.sh from requirements.txt)
 #   old-code/logs/               Slurm job logs + heart_beat.log
-#   old-code/save_data/          eval results + summary.tsv
+#   old-code/save_data/          eval results + summary.tsv (committed + pushed)
+#   old-code/logs/startup_errors.log  errors before a job's own log exists
 #   old-code/journal.txt         heart_beat job journal
 #   $LUSTRE_OLD/checkpoints/     training checkpoints (only the last
 #                                KEEP_CHECKPOINTS per run, via save_total_limit)
@@ -20,10 +21,33 @@
 
 : "${OLD_ROOT:?OLD_ROOT must be set before sourcing marvin_common.sh}"
 
-# Disentangling-Reasoning checkout (default: sibling of analyse-old-code/).
-DR_ROOT="${DR_ROOT:-$(dirname "$(dirname "$OLD_ROOT")")/Disentangling-Reasoning}"
-if [ ! -f "$DR_ROOT/script/model_resources.sh" ]; then
-    echo "ERROR: $DR_ROOT/script/model_resources.sh not found -- set DR_ROOT=..." >&2
+# Every job's Slurm stdout/stderr is /dev/null until it redirects into logs/,
+# so anything failing before that is logged here instead.
+startup_error() {
+    mkdir -p "$OLD_ROOT/logs"
+    echo "[$(date +'%F %T')] ${SLURM_JOB_NAME:-manual} job=${SLURM_JOB_ID:-} host=$(hostname): $*" \
+        | tee -a "$OLD_ROOT/logs/startup_errors.log" >&2
+}
+
+# Disentangling-Reasoning checkout (venv-independent helpers + Lustre model
+# store). DR_ROOT=... wins; otherwise the first of: next to old-code, next to
+# its parent, ~/Disentangling-Reasoning, or any checkout up to 3 levels below
+# $HOME (its folder name differs between machines).
+find_dr_root() {
+    local c
+    for c in "${DR_ROOT:-}" \
+             "$(dirname "$OLD_ROOT")/Disentangling-Reasoning" \
+             "$(dirname "$(dirname "$OLD_ROOT")")/Disentangling-Reasoning" \
+             "$HOME/Disentangling-Reasoning"; do
+        [ -n "$c" ] && [ -f "$c/script/model_resources.sh" ] && [ -f "$c/script/download_model.sh" ] \
+            && { (cd "$c" && pwd); return 0; }
+    done
+    c="$(find "$HOME" -maxdepth 4 -path '*/script/download_model.sh' -not -path "$OLD_ROOT/*" 2>/dev/null | head -n1)"
+    [ -n "$c" ] && { dirname "$(dirname "$c")"; return 0; }
+    return 1
+}
+if ! DR_ROOT="$(find_dr_root)"; then
+    startup_error "Disentangling-Reasoning checkout not found (need script/model_resources.sh + script/download_model.sh) -- set DR_ROOT=/path/to/it"
     return 1 2>/dev/null || exit 1
 fi
 SERVER=marvin
@@ -90,6 +114,41 @@ load_hf_token() {
         return 1
     }
     export HF_TOKEN
+}
+
+# Commits save_data/ (only that path) and pushes it to the branch's upstream.
+# Called by eval.sh when a result is written and by heart_beat.sh every pass
+# (retries anything a job couldn't push). Best-effort: never fails the caller.
+# COMMIT_RESULTS=0 disables it. A mkdir lock serializes parallel evals.
+commit_results() {
+    [ "${COMMIT_RESULTS:-1}" = "1" ] || return 0
+    local lock="$OLD_ROOT/.git/results_commit.lock" waited=0 rc=0
+    until mkdir "$lock" 2>/dev/null; do
+        # stale lock (killed job) after 10 min
+        if [ $(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || date +%s) )) -gt 600 ]; then
+            rm -rf "$lock"; continue
+        fi
+        [ "$waited" -ge 300 ] && { echo "commit_results: lock busy, skipping (next heart_beat pass retries)"; return 0; }
+        sleep 5; waited=$((waited + 5))
+    done
+    (
+        cd "$OLD_ROOT" || exit 1
+        git add -A -- save_data || exit 1
+        if ! git diff --cached --quiet -- save_data; then
+            n="$(git diff --cached --name-only -- save_data | wc -l)"
+            git -c user.name="$(git config user.name || echo "${USER:-heart_beat}")" \
+                -c user.email="$(git config user.email || echo "${USER:-heart_beat}@$(hostname -f 2>/dev/null || hostname)")" \
+                commit -q -m "results: $n file(s) from ${SLURM_JOB_NAME:-manual} ${SLURM_JOB_ID:-} ($(date +'%F %T'))" -- save_data || exit 1
+            echo "commit_results: committed $n file(s)"
+        fi
+        # push whatever is ahead of upstream (also earlier commits whose push failed)
+        [ -n "$(git rev-list '@{u}..HEAD' 2>/dev/null)" ] || exit 0
+        git push -q 2>&1 || { git pull -q --rebase --autostash 2>&1 && git push -q 2>&1; } || exit 1
+        echo "commit_results: pushed to $(git rev-parse --abbrev-ref '@{u}')"
+    ) || rc=$?
+    rm -rf "$lock"
+    [ "$rc" -eq 0 ] || echo "commit_results: git commit/push failed (rc=$rc) -- will retry next heart_beat pass"
+    return 0
 }
 
 # Makes sure $1 is in the Lustre model store; echoes nothing, fails on error.

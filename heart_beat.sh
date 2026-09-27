@@ -27,6 +27,8 @@
 #   3. eval   : per finished run, per kept checkpoint-* (only KEEP_CHECKPOINTS
 #               exist on Lustre), done = save_data/<ds>/<model>/<ckpt>_output.json.
 #               Otherwise (re)submit eval.sh for that checkpoint.
+#   4. results: commit + push save_data/ (eval.sh already does this per
+#               result; this retries failed pushes). COMMIT_RESULTS=0 disables.
 #   Each job key is (re)submitted at most MAX_ATTEMPTS times, then GAVE_UP
 #   (raise MAX_ATTEMPTS or delete the key's lines in journal.txt to retry).
 #
@@ -230,6 +232,11 @@ run_pass() {
     local k summary=""
     for k in "${!COUNT[@]}"; do summary+="$k=${COUNT[$k]} "; done
     log "summary: ${summary:-nothing tracked}"
+
+    # 4) results -> git (catches anything an eval job couldn't push itself)
+    if [ "$DRY_RUN" -eq 0 ] && [ "$STATUS_ONLY" -eq 0 ]; then
+        commit_results 2>&1 | while IFS= read -r line; do log "$line"; done
+    fi
     log "===== pass end ====="
 }
 
